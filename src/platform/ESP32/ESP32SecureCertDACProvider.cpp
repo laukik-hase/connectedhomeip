@@ -23,9 +23,14 @@
 #include <platform/ESP32/ESP32Config.h>
 #include <platform/ESP32/ESP32SecureCertDACProvider.h>
 
-#ifdef CONFIG_USE_ESP32_ECDSA_PERIPHERAL
+#if defined(CONFIG_USE_ESP32_ECDSA_PERIPHERAL) || defined(CONFIG_USE_ESP32_TEE)
 #include <platform/ESP32/ESP32CHIPCryptoPAL.h>
-#endif // CONFIG_USE_ESP32_ECDSA_PERIPHERAL
+#endif // CONFIG_USE_ESP32_ECDSA_PERIPHERAL || CONFIG_USE_ESP32_TEE
+
+#if defined(CONFIG_USE_ESP32_TEE_DAC_KEY_PBKDF2)
+#include <platform/ESP32/ESP32FactoryDataProvider.h>
+#include "esp_tee_sec_storage.h"
+#endif // CONFIG_USE_ESP32_TEE_DAC_KEY_PBKDF2
 
 #define TAG "dac_provider"
 
@@ -130,8 +135,9 @@ CHIP_ERROR ESP32SecureCertDACProvider ::SignWithDeviceAttestationKey(const ByteS
     // This flow is for devices supporting ECDSA peripheral
     if (keyType == ESP_SECURE_CERT_ECDSA_PERIPHERAL_KEY)
     {
-#ifdef CONFIG_USE_ESP32_ECDSA_PERIPHERAL
         Crypto::ESP32P256Keypair keypair;
+
+#ifdef CONFIG_USE_ESP32_ECDSA_PERIPHERAL
         uint8_t efuseBlockId;
 
         esp_err = esp_secure_cert_get_priv_key_efuse_id(&efuseBlockId);
@@ -145,9 +151,53 @@ CHIP_ERROR ESP32SecureCertDACProvider ::SignWithDeviceAttestationKey(const ByteS
                             ESP_LOGE(TAG, "Failed to initialize the keypair err:%" CHIP_ERROR_FORMAT, chipError.Format()));
 
         chipError = keypair.ECDSA_sign_msg(messageToSign.data(), messageToSign.size(), signature);
-        VerifyOrReturnError(
-            chipError == CHIP_NO_ERROR, chipError,
-            ESP_LOGE(TAG, "Failed to sign with device attestation key, err:%" CHIP_ERROR_FORMAT, chipError.Format()));
+        VerifyOrReturnError(chipError == CHIP_NO_ERROR, chipError,
+                            ESP_LOGE(TAG, "Failed to sign with device attestation key, err:%" CHIP_ERROR_FORMAT, chipError.Format()));
+
+#elif defined(CONFIG_USE_ESP32_TEE_DAC_KEY_FLASH)
+        const char * key_id = chip::DeviceLayer::Internal::ESP32Config::kConfigKey_DACPrivateKey.Name;
+
+        ESP_LOGD(TAG, "TEE secure storage key id: %s", key_id);
+
+        chipError = keypair.InitializeFromTEE(chip::Crypto::ECPKeyTarget::ECDSA, key_id);
+        VerifyOrReturnError(chipError == CHIP_NO_ERROR, chipError,
+                            ESP_LOGE(TAG, "Failed to initialize the keypair err:%" CHIP_ERROR_FORMAT, chipError.Format()));
+
+        chipError = keypair.ECDSA_sign_msg(messageToSign.data(), messageToSign.size(), signature);
+        VerifyOrReturnError(chipError == CHIP_NO_ERROR, chipError,
+                            ESP_LOGE(TAG, "Failed to sign with device attestation key, err:%" CHIP_ERROR_FORMAT, chipError.Format()));
+
+#elif defined(CONFIG_USE_ESP32_TEE_DAC_KEY_PBKDF2)
+        /* TODO: Fetch salt from Secure Cert partition */
+        uint8_t salt[chip::Crypto::kSpake2p_Max_PBKDF_Salt_Length] = { 0 };
+        chip::MutableByteSpan span(salt, sizeof(salt));
+
+        ESP32FactoryDataProvider sFactoryDataProvider;
+        chipError = sFactoryDataProvider.GetSpake2pSalt(span);
+        VerifyOrReturnError(chipError == CHIP_NO_ERROR, chipError,
+                            ESP_LOGE(TAG, "Failed to fetch the PBKDF2 salt err:%" CHIP_ERROR_FORMAT, chipError.Format()));
+
+        uint8_t digest[chip::Crypto::kSHA256_Hash_Length];
+        memset(&digest[0], 0, sizeof(digest));
+        ReturnErrorOnFailure(chip::Crypto::Hash_SHA256(messageToSign.data(), messageToSign.size(), &digest[0]));
+
+        esp_tee_sec_storage_pbkdf2_ctx_t ctx = {
+            .salt = salt,
+            .salt_len = sizeof(salt),
+            .key_type = ESP_SEC_STG_KEY_ECDSA_SECP256R1
+        };
+
+        esp_tee_sec_storage_ecdsa_sign_t sign = {};
+        esp_tee_sec_storage_ecdsa_pubkey_t pubkey = {};
+
+        esp_err = esp_tee_sec_storage_ecdsa_sign_pbkdf2(&ctx, digest, sizeof(digest), &sign, &pubkey);
+        VerifyOrReturnError(esp_err == ESP_OK, CHIP_ERROR_INTERNAL,
+                            ESP_LOGE(TAG, "Failed to sign with device attestation key, esp_err:%d", esp_err));
+
+        memcpy(signature.Bytes() + 0u, sign.sign_r, chip::Crypto::kP256_FE_Length);
+        memcpy(signature.Bytes() + chip::Crypto::kP256_FE_Length, sign.sign_s, chip::Crypto::kP256_FE_Length);
+
+        VerifyOrReturnError(signature.SetLength(chip::Crypto::kP256_ECDSA_Signature_Length_Raw) == CHIP_NO_ERROR, chipError = CHIP_ERROR_INTERNAL);
 #else
         return CHIP_ERROR_INCORRECT_STATE;
 #endif // CONFIG_USE_ESP32_ECDSA_PERIPHERAL

@@ -329,6 +329,10 @@ if (CONFIG_USE_ESP32_ECDSA_PERIPHERAL)
     chip_gn_arg_append("chip_use_esp32_ecdsa_peripheral" "true")
 endif()
 
+if (CONFIG_USE_ESP32_TEE)
+    chip_gn_arg_append("chip_use_esp32_tee" "true")
+endif()
+
 if (CONFIG_ENABLE_ESP_INSIGHTS_TRACE)
    target_include_directories(${COMPONENT_LIB} INTERFACE "${CHIP_ROOT}/src/tracing/esp32_trace/include")
 endif()
@@ -474,6 +478,10 @@ endif()
 
 if (CONFIG_ENABLE_ENCRYPTED_OTA)
     list(APPEND matter_requires espressif__esp_encrypted_img)
+endif()
+
+if (CONFIG_USE_ESP32_TEE)
+    list(APPEND matter_requires tee_sec_storage)
 endif()
 
 add_prebuilt_library(matterlib "${CMAKE_CURRENT_BINARY_DIR}/lib/libCHIP.a"
